@@ -3,6 +3,7 @@
   NET.LUA           <- NET.LUA.orig + DHCP (net_autoconnect.lua) + loads netprobe.lez
   SONG_BROWSER.LUA  <- SONG_BROWSER.LUA.orig + asynchronous check of /http/ streams
   KEYBOARD_EMU.LUA  <- KEYBOARD_EMU.LUA.orig + Start pauses/resumes playback
+  PLAYLIST.LUA      <- PLAYLIST.LUA.orig + #DCPLAYA-REMOTE: playlists loaded from the proxy
 
 usage: python make_lua.py   (expects NET.LUA.orig and SONG_BROWSER.LUA.orig here;
                              extract them with: python extract_file.py)
@@ -119,6 +120,52 @@ PAUSE_KEY = '''   -- W5500 patch: while something is playing and the virtual key
    -- activating key toggle'''
 
 
+REMOTE = '''   local file = openfile(fname,"r")
+   if not file then
+      print("playlist_load : open error ["..fname.."]")
+      return
+   end
+
+   -- W5500 patch: "#DCPLAYA-REMOTE:/http/..." lines at the top of a playlist
+   -- point to an always up-to-date copy (e.g. YouTube channel lists on the TV
+   -- proxy).  The first one that answers with an m3u is used; otherwise the
+   -- rest of this file is the fallback.
+   local line = read(file)
+   while line do
+      local s, e, remote = strfind(line, "^#DCPLAYA%-REMOTE:([^\\r]+)")
+      if not s then break end
+      print("playlist : trying "..remote)
+      local rfile = openfile(remote, "r")
+      if rfile then
+         local head = read(rfile)
+         if head and strfind(head, "^#EXTM3U") then
+            print("playlist : using "..remote)
+            closefile(file)
+            file = rfile
+            line = nil
+            break
+         end
+         closefile(rfile)
+      end
+      line = read(file)
+   end
+   if line then
+      seek(file, "set", 0)
+   end
+'''
+
+
+def make_playlist():
+    s = open('PLAYLIST.LUA.orig', 'rb').read().decode('latin-1')
+    s = sub1(s, '''   local file = openfile(fname,"r")
+   if not file then
+      print("playlist_load : open error ["..fname.."]")
+      return
+   end
+''', REMOTE)
+    open('PLAYLIST.LUA', 'wb').write(s.encode('latin-1'))
+
+
 def make_keyboard_emu():
     s = open('KEYBOARD_EMU.LUA.orig', 'rb').read().decode('latin-1')
     s = sub1(s, '   -- activating key toggle', PAUSE_KEY)
@@ -129,4 +176,5 @@ if __name__ == '__main__':
     make_net()
     make_song_browser()
     make_keyboard_emu()
-    print('NET.LUA, SONG_BROWSER.LUA and KEYBOARD_EMU.LUA generated')
+    make_playlist()
+    print('NET.LUA, SONG_BROWSER.LUA, KEYBOARD_EMU.LUA and PLAYLIST.LUA generated')

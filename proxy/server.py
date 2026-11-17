@@ -41,7 +41,10 @@ a real Dreamcast, see tune.env):
 CLI:  python server.py --playlist HOST[:PORT] TOKEN [channels.m3u]
       prints the dcplaya playlist (used to put it on the CD image).
 """
+import base64
+import hmac
 import http.server
+import json
 import os
 import re
 import signal
@@ -66,13 +69,14 @@ ABITRATE = os.environ.get('ABITRATE', '128k')
 ACHANNELS = os.environ.get('ACHANNELS', '2')
 MUXRATE = os.environ.get('MUXRATE', '600k')
 GOP = os.environ.get('GOP', '30')                # frames between I-frames (longer = cheaper to decode)
-AFILTER = os.environ.get('AFILTER', 'volume=0.5,alimiter=limit=0.7:level=false')  # tame loud TV audio (clipping = pops on the DC)
+AFILTER = os.environ.get('AFILTER', 'loudnorm=I=-14:TP=-1.5:LRA=11')  # same loudness for every channel, close to web radios
 ACODEC = os.environ.get('ACODEC', 'libmp3lame')        # mp2 or libmp3lame
 ASRATE = os.environ.get('ASRATE', '44100')       # keep 44100: other rates break dcplaya's A/V sync
 VBUFSIZE = os.environ.get('VBUFSIZE', '1000k')     # rate-control buffer (smaller = steadier quality)
 # Encoder tweaks: only change these after testing on a real console.
 VENC_EXTRA = os.environ.get('VENC_EXTRA', '-qmin 2')  # RD options measured better but looked worse on the DC
-VDENOISE = os.environ.get('VDENOISE', '')  # e.g. hqdn3d=2:1.5:3:2.5, (looked worse on the DC)
+VSCALER = os.environ.get('VSCALER', 'area')    # area averages pixels: no aliasing on 10x downscales (lanczos made blocks)
+VDENOISE = os.environ.get('VDENOISE', 'gblur=sigma=0.5,')  # after scaling: drops detail 192x144 can't show (blocky frames 107 -> 4 of 451)
 VDEINT = os.environ.get('VDEINT', '')  # e.g. bwdif=mode=send_frame:deint=interlaced, (looked worse on the DC)
 VCODEC = os.environ.get('VCODEC', 'mpeg1video')  # mpeg1video (PS), mpeg2video (VOB), mpeg4 (DivX AVI)
 AUDIO = os.environ.get('AUDIO', '1') != '0'
@@ -90,6 +94,15 @@ def rate_bps(v):
     return float(v.rstrip('km')) * mult
 MAX_STREAMS = int(os.environ.get('MAX_STREAMS', '3'))
 UPSTREAM_UA = os.environ.get('UPSTREAM_UA', 'VLC/3.0.20 LibVLC/3.0.20')
+# YouTube (needs yt-dlp + deno in the image); 18 = small mp4 with audio
+YT_FORMAT = os.environ.get('YT_FORMAT', '18/best[height<=360][vcodec!=none][acodec!=none]/worst')
+YT_LIVE_FORMAT = os.environ.get('YT_LIVE_FORMAT', '91/92/93/best[height<=480]')
+YT_MAX = int(os.environ.get('YT_MAX', '20'))   # newest videos played from a channel
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')   # /admin page (disabled when empty)
+ADMIN_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'admin.html')
+YT_CHANNELS = os.environ.get('YT_CHANNELS', '/data/youtube.m3u')  # one dcplaya playlist per channel
+YT_LIST_MAX = int(os.environ.get('YT_LIST_MAX', '25'))            # videos per channel playlist
+YT_REFRESH_HOURS = float(os.environ.get('YT_REFRESH_HOURS', '24'))  # background refresh period
 STD_FPS = ('23.976', '24', '25', '29.97', '30')
 FIRST_BYTE_TIMEOUT = 25
 CHUNK = 16 * 1024
@@ -149,14 +162,312 @@ def dc_playlist(host, token, chans):
     return '\n'.join(out) + '\n'
 
 
+# ------------------------------------------------------------------ YouTube
+
+class SourceError(Exception):
+    pass
+
+
+YT_RE = re.compile(r'^https?://(www\.|m\.)?(youtube\.com|youtu\.be)/', re.I)
+_yt_cache = {}              # key -> (expires, value)
+_yt_lock = threading.Lock()
+
+
+def yt_kind(url):
+    """None (not YouTube), 'video', 'live' or 'list' (channel / playlist)."""
+    if not YT_RE.match(url):
+        return None
+    path = url.split('?', 1)[0].rstrip('/')
+    if path.endswith('/live'):
+        return 'live'
+    if '/watch' in path or 'youtu.be/' in path or '/shorts/' in path or '/live/' in path:
+        return 'video'
+    return 'list'
+
+
+def _yt_cached(key, ttl, fn):
+    now = time.time()
+    with _yt_lock:
+        hit = _yt_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    value = fn()
+    with _yt_lock:
+        _yt_cache[key] = (now + ttl, value)
+    return value
+
+
+def _ytdlp(args, timeout=60):
+    try:
+        r = subprocess.run(['yt-dlp', '--no-warnings'] + args,
+                           capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise SourceError('yt-dlp is not installed')
+    except subprocess.TimeoutExpired:
+        raise SourceError('yt-dlp timed out')
+    out = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    if r.returncode or not out:
+        err = (r.stderr.strip().splitlines() or ['no output'])[-1]
+        raise SourceError(err[:160])
+    return out
+
+
+def yt_media_url(url, live=False):
+    """Direct media URL (they expire after a few hours: cached for less)."""
+    fmt = YT_LIVE_FORMAT if live else YT_FORMAT
+    return _yt_cached(('url', url, fmt), 60 if live else 2 * 3600,
+                      lambda: _ytdlp(['--no-playlist', '-f', fmt, '-g', url])[0])
+
+
+def yt_list(url):
+    """Newest YT_MAX video ids of a channel, or the videos of a playlist."""
+    if 'list=' not in url and not re.search(r'/(videos|streams|shorts)/?$', url):
+        url = url.rstrip('/') + '/videos'
+    return _yt_cached(('list', url), 30 * 60, lambda: _ytdlp(
+        ['--flat-playlist', '--playlist-end', str(YT_MAX), '--print', 'id', url]))
+
+
+def source_args(chan):
+    """ffmpeg input arguments for a channel (resolving YouTube links)."""
+    if chan.get('yt_id'):
+        return ['-i', f"http://127.0.0.1:{PORT}/_yt/{chan['yt_id']}"]
+    url = chan['url']
+    kind = yt_kind(url)
+    net = ['-reconnect', '1', '-reconnect_streamed', '1',
+           '-reconnect_on_network_error', '1', '-reconnect_delay_max', '4']
+    if kind is None:
+        return ['-user_agent', UPSTREAM_UA] + net + ['-i', url]
+    if kind == 'live':
+        return net + ['-i', yt_media_url(url, live=True)]
+    if kind == 'video':
+        vid = _ytdlp(['--no-playlist', '--print', 'id', url])[0]
+        return ['-i', f'http://127.0.0.1:{PORT}/_yt/{vid}']
+    # channel / playlist: play the videos back to back.  Each entry is a local
+    # URL that redirects to the media, so a video is only resolved when reached.
+    ids = yt_list(url)
+    name = re.sub(r'[^A-Za-z0-9]', '_', url)[-80:]
+    path = os.path.join('/tmp', f'yt_{name}.ffconcat')
+    with open(path, 'w') as f:
+        f.write('ffconcat version 1.0\n')
+        for vid in ids:
+            f.write(f"file 'http://127.0.0.1:{PORT}/_yt/{vid}'\n")
+    return ['-f', 'concat', '-safe', '0',
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto', '-i', path]
+
+
+# ---------------------------------------------- YouTube channel playlists
+
+_ytl_lock = threading.Lock()
+_ytl = {'mtime': None, 'chans': [], 'videos': {}, 'stamp': {}}
+
+
+def yt_channels():
+    """Channels of YT_CHANNELS (m3u: #EXTINF:...,Name + channel URL)."""
+    with _ytl_lock:
+        try:
+            m = os.path.getmtime(YT_CHANNELS)
+        except OSError:
+            return []
+        if m != _ytl['mtime']:
+            _ytl['chans'] = parse_m3u(YT_CHANNELS)
+            _ytl['mtime'] = m
+            _ytl['videos'], _ytl['stamp'] = {}, {}
+            log(f'loaded {len(_ytl["chans"])} YouTube channels from {YT_CHANNELS}')
+        return list(_ytl['chans'])
+
+
+def yt_fetch_videos(url):
+    if 'list=' not in url and not re.search(r'/(videos|streams|shorts)/?$', url):
+        url = url.rstrip('/') + '/videos'
+    out = []
+    for line in _ytdlp(['--flat-playlist', '--playlist-end', str(YT_LIST_MAX),
+                        '--print', '%(id)s\t%(duration)s\t%(title)s', url], timeout=120):
+        vid, dur, title = (line.split('\t', 2) + ['', ''])[:3]
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', vid):
+            continue
+        name = ascii_name(title)[:44]
+        try:
+            name += f' ({max(1, round(float(dur) / 60))} min)'
+        except ValueError:
+            pass
+        out.append({'id': vid, 'name': name})
+    return out
+
+
+def yt_refresh(n, chan):
+    try:
+        vids = yt_fetch_videos(chan['url'])
+    except SourceError as e:
+        log(f'youtube list {n} {chan["name"]!r}: {e}')
+        return
+    with _ytl_lock:
+        _ytl['videos'][n] = vids
+        _ytl['stamp'][n] = time.time()
+    log(f'youtube list {n} {chan["name"]!r}: {len(vids)} videos')
+
+
+def yt_videos(n):
+    chans = yt_channels()
+    if not 1 <= n <= len(chans):
+        return None
+    with _ytl_lock:
+        vids = _ytl['videos'].get(n)
+    if vids is None:                      # not fetched yet: do it now
+        yt_refresh(n, chans[n - 1])
+        with _ytl_lock:
+            vids = _ytl['videos'].get(n, [])
+    return vids
+
+
+def yt_refresher():
+    """Daily job: refresh every channel's video list."""
+    while True:
+        for n, chan in enumerate(yt_channels(), 1):
+            with _ytl_lock:
+                age = time.time() - _ytl['stamp'].get(n, 0)
+            if age >= YT_REFRESH_HOURS * 3600:
+                yt_refresh(n, chan)
+        time.sleep(600)
+
+
+def yt_playlist(host, token, n):
+    """n = channel number, or 0 for every channel in one list."""
+    chans = yt_channels()
+    if n == 0:
+        numbers = range(1, len(chans) + 1)
+    elif 1 <= n <= len(chans):
+        numbers = [n]
+    else:
+        return None
+    out = ['#EXTM3U']
+    for k in numbers:
+        prefix = f'{ascii_name(chans[k - 1]["name"])[:18]}: ' if n == 0 else ''
+        for v in yt_videos(k) or []:
+            out.append(f'#EXTINF:0,{prefix}{v["name"]}')
+            out.append(f'/http/{host}/{token}/yt/v/{v["id"]}.mpg<endpath>')
+    return '\n'.join(out) + '\n'
+
+
+# ------------------------------------------------------------------ admin
+
+def m3u_read_full(path):
+    """Entries with their #EXTINF attributes, for the editor."""
+    items, extinf, header = [], None, '#EXTM3U'
+    try:
+        lines = open(path, encoding='utf-8', errors='replace').read().splitlines()
+    except OSError:
+        return header, []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith('#EXTM3U'):
+            header = line
+        elif line.startswith('#EXTINF'):
+            extinf = line
+        elif not line.startswith('#'):
+            attrs, name = '', ''
+            if extinf:
+                body = extinf.split(':', 1)[1]
+                quoted, cut = False, -1
+                for i, ch in enumerate(body):          # first comma outside quotes
+                    if ch == '"':
+                        quoted = not quoted
+                    elif ch == ',' and not quoted:
+                        cut = i
+                        break
+                if cut >= 0:
+                    attrs, name = body[:cut], body[cut + 1:]
+                else:
+                    attrs = body
+                attrs = re.sub(r'^\s*-?\d+(\.\d+)?\s*', '', attrs)
+            items.append({'name': name.strip() or line.rsplit('/', 1)[-1],
+                          'url': line, 'attrs': attrs.strip()})
+            extinf = None
+    return header, items
+
+
+def m3u_write_full(path, header, items):
+    """Rewrite in place (keeps the file's owner/mode) after a backup."""
+    bdir = os.path.join(os.path.dirname(path), 'backups')
+    os.makedirs(bdir, exist_ok=True)
+    if os.path.exists(path):
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        with open(path, 'rb') as src, \
+                open(os.path.join(bdir, f'{os.path.basename(path)}.{stamp}'), 'wb') as dst:
+            dst.write(src.read())
+        olds = sorted(f for f in os.listdir(bdir) if f.startswith(os.path.basename(path) + '.'))
+        for f in olds[:-30]:
+            os.remove(os.path.join(bdir, f))
+    out = [header if header.startswith('#EXTM3U') else '#EXTM3U']
+    for it in items:
+        attrs = (' ' + it['attrs']) if it.get('attrs') else ''
+        out.append(f'#EXTINF:-1{attrs},{it["name"]}')
+        out.append(it['url'])
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('\n'.join(out) + '\n')
+
+
+def admin_clean(items):
+    clean = []
+    for it in items:
+        name = str(it.get('name', '')).replace('\n', ' ').replace(',', ' ').strip()
+        url = str(it.get('url', '')).strip()
+        attrs = str(it.get('attrs', '')).replace('\n', ' ').strip()
+        if not url:
+            continue
+        if not re.match(r'^https?://\S+$', url):
+            raise ValueError(f'invalid URL: {url[:60]}')
+        clean.append({'name': name or url.rsplit('/', 1)[-1], 'url': url, 'attrs': attrs})
+    return clean
+
+
+def admin_state():
+    _, tv = m3u_read_full(CHANNELS)
+    _, yt = m3u_read_full(YT_CHANNELS)
+    with _ytl_lock:
+        for n, c in enumerate(yt, 1):
+            vids = _ytl['videos'].get(n)
+            c['videos'] = len(vids) if vids is not None else None
+            c['latest'] = vids[0]['name'] if vids else ''
+            stamp = _ytl['stamp'].get(n)
+            c['updated'] = time.strftime('%d/%m %H:%M', time.localtime(stamp)) if stamp else ''
+    return {'tv': tv, 'yt': yt, 'token': TOKEN, 'refresh_hours': YT_REFRESH_HOURS}
+
+
+def admin_check(url):
+    """Quick test of one source URL for the editor."""
+    kind = yt_kind(url)
+    if kind == 'list':
+        try:
+            vids = yt_fetch_videos(url)
+            return bool(vids), f'{len(vids)} videos' + (f': {vids[0]["name"]}' if vids else '')
+        except SourceError as e:
+            return False, str(e)
+    if kind:
+        try:
+            _ytdlp(['--no-playlist', '--print', 'title', url])
+            return True, 'YouTube ok'
+        except SourceError as e:
+            return False, str(e)
+    ok, why = check_upstream(url)
+    return ok, f'HTTP {why}' if ok else why
+
+
+def yt_refresh_all_now():
+    for n, chan in enumerate(yt_channels(), 1):
+        yt_refresh(n, chan)
+
+
 # ------------------------------------------------------------------ streams
 
 _streams = {}               # key -> (Popen, started)
 _streams_lock = threading.Lock()
 
 
-def ffmpeg_cmd(url):
-    vf = (f'{VDEINT}fps={FPS},scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,'
+def ffmpeg_cmd(inp):
+    """inp: ffmpeg input arguments (see source_args)."""
+    vf = (f'{VDEINT}fps={FPS},scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease:flags={VSCALER},'
           f'{VDENOISE}pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS}')
     if VIDEO:
         video = ['-map', '0:v:0'] + (['-map', '0:a:0?'] if AUDIO else []) + [
@@ -170,14 +481,10 @@ def ffmpeg_cmd(url):
         video = ['-map', '0:a:0', '-vn']          # audio-only (diagnostics)
     return [
         'ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
-        '-user_agent', UPSTREAM_UA,
-        '-reconnect', '1', '-reconnect_streamed', '1',
-        '-reconnect_on_network_error', '1', '-reconnect_delay_max', '4',
         '-fflags', '+genpts+discardcorrupt',
         '-probesize', '2M', '-analyzeduration', '3M',
         '-threads', '2',
-        '-i', url,
-    ] + video + (['-af', AFILTER, '-c:a', ACODEC, '-ar', ASRATE, '-ac', ACHANNELS, '-b:a', ABITRATE] if AUDIO else ['-an']) + [
+    ] + inp + video + (['-af', AFILTER, '-c:a', ACODEC, '-ar', ASRATE, '-ac', ACHANNELS, '-b:a', ABITRATE] if AUDIO else ['-an']) + [
     ] + (['-f', 'avi'] if VCODEC == 'mpeg4' else
          ['-f', 'vob' if VCODEC == 'mpeg2video' else 'mpeg',
           '-muxrate', MUXRATE, '-muxdelay', '0.7']) + ['pipe:1']
@@ -247,7 +554,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = 'dcplaya-tv-proxy'
 
     def log_message(self, fmt, *args):
-        pass
+        if os.environ.get('DEBUG_REQUESTS') == '1':      # troubleshooting only
+            log(f'request {self.client_address[0]}: {re.sub(TOKEN or "-", "<TOKEN>", fmt % args)}')
 
     def client_key(self):
         return (self.headers.get('CF-Connecting-IP')
@@ -266,10 +574,81 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def admin_auth(self):
+        """HTTP basic auth (any user name, password ADMIN_PASSWORD)."""
+        if not ADMIN_PASSWORD:
+            self.reply(404, b'admin disabled: set ADMIN_PASSWORD\n')
+            return False
+        hdr = self.headers.get('Authorization', '')
+        if hdr.startswith('Basic '):
+            try:
+                pw = base64.b64decode(hdr[6:]).decode('utf-8', 'replace').split(':', 1)[1]
+            except (ValueError, IndexError):
+                pw = ''
+            if hmac.compare_digest(pw.encode(), ADMIN_PASSWORD.encode()):
+                return True
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="dc-tv-proxy"')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+        return False
+
+    def reply_json(self, obj, code=200):
+        self.reply(code, json.dumps(obj).encode('utf-8'), 'application/json; charset=utf-8')
+
+    def admin_get(self, path):
+        if not self.admin_auth():
+            return
+        if path in ('/admin', '/admin/'):
+            try:
+                body = open(ADMIN_HTML, 'rb').read()
+            except OSError:
+                return self.reply(500, b'admin.html missing\n')
+            return self.reply(200, body, 'text/html; charset=utf-8')
+        if path == '/admin/api/state':
+            return self.reply_json(admin_state())
+        return self.reply(404, b'not found\n')
+
+    def do_POST(self):
+        path = self.path.split('?', 1)[0]
+        if not path.startswith('/admin/api/') or not self.admin_auth():
+            if not path.startswith('/admin/api/'):
+                self.reply(404, b'not found\n')
+            return
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+            data = json.loads(self.rfile.read(min(n, 2_000_000)) or b'{}')
+        except ValueError:
+            return self.reply_json({'ok': False, 'error': 'bad json'}, 400)
+        try:
+            if path in ('/admin/api/tv', '/admin/api/yt'):
+                target = CHANNELS if path.endswith('/tv') else YT_CHANNELS
+                header, _ = m3u_read_full(target)
+                items = admin_clean(data.get('items', []))
+                m3u_write_full(target, header, items)
+                log(f'admin: saved {len(items)} entries to {target}')
+                if path.endswith('/yt'):
+                    threading.Thread(target=yt_refresh_all_now, daemon=True).start()
+                return self.reply_json({'ok': True, 'count': len(items)})
+            if path == '/admin/api/yt/refresh':
+                threading.Thread(target=yt_refresh_all_now, daemon=True).start()
+                return self.reply_json({'ok': True})
+            if path == '/admin/api/check':
+                ok, msg = admin_check(str(data.get('url', '')).strip())
+                return self.reply_json({'ok': ok, 'msg': msg})
+        except (ValueError, OSError) as e:
+            return self.reply_json({'ok': False, 'error': str(e)}, 400)
+        return self.reply(404, b'not found\n')
+
     def do_GET(self):
         path = self.path.split('?', 1)[0]
         if path == '/health':
             return self.reply(200, b'ok\n')
+        if path == '/admin' or path.startswith('/admin/'):
+            return self.admin_get(path)
+        m = re.fullmatch(r'/_yt/([A-Za-z0-9_-]{6,20})', path)
+        if m and self.client_address[0] == '127.0.0.1':
+            return self.relay_youtube(m.group(1))
         parts = path.strip('/').split('/')
         if not TOKEN or len(parts) < 2 or parts[0] != TOKEN:
             return self.reply(404, b'not found\n')
@@ -280,6 +659,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             host = m.group(1) if m else (self.headers.get('Host') or f'localhost:{PORT}')
             body = dc_playlist(host, TOKEN, channels()).encode('ascii')
             return self.reply(200, body, 'audio/x-mpegurl')
+
+        if parts[1] == 'yt':
+            return self.youtube_route(parts[2:])
 
         m = re.fullmatch(r'(\d+)\.mpg', parts[2]) if len(parts) == 3 and parts[1] == 'ch' else None
         if not m:
@@ -292,16 +674,86 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ua = self.headers.get('User-Agent', '')
 
         if ua == 'dcplaya' or self.command == 'HEAD':
-            ok, why = check_upstream(chan['url'])
+            if yt_kind(chan['url']):
+                try:   # resolving also warms the cache for the real request
+                    source_args(chan)
+                    ok, why = True, ''
+                except SourceError as e:
+                    ok, why = False, str(e)
+            else:
+                ok, why = check_upstream(chan['url'])
             log(f'probe ch{n} {chan["name"]!r}: {"ok" if ok else "FAIL " + why}')
             return self.reply(200 if ok else 502, b'')
 
         self.stream(n, chan)
 
+    def youtube_route(self, rest):
+        """/TOKEN/yt/index.txt, /TOKEN/yt/<n>.m3u, /TOKEN/yt/v/<id>.mpg"""
+        if rest == ['index.txt']:
+            body = ''.join(f'{i}\t{c["name"]}\n' for i, c in enumerate(yt_channels(), 1))
+            return self.reply(200, body.encode('ascii', 'replace'))
+        m = re.fullmatch(r'(\d+|all)\.m3u', rest[0]) if len(rest) == 1 else None
+        if m:
+            q = self.path.split('?', 1)[1] if '?' in self.path else ''
+            hm = re.search(r'(?:^|&)host=([A-Za-z0-9.:-]+)', q)
+            host = hm.group(1) if hm else (self.headers.get('Host') or f'localhost:{PORT}')
+            body = yt_playlist(host, TOKEN, 0 if m.group(1) == 'all' else int(m.group(1)))
+            if body is None:
+                return self.reply(404, b'no such channel\n')
+            log(f'youtube playlist {m.group(1)} for {self.client_key()}')
+            return self.reply(200, body.encode('ascii'), 'audio/x-mpegurl')
+        m = re.fullmatch(r'([A-Za-z0-9_-]{11})\.mpg', rest[1]) if len(rest) == 2 and rest[0] == 'v' else None
+        if not m:
+            return self.reply(404, b'not found\n')
+        vid = m.group(1)
+        if self.headers.get('User-Agent', '') == 'dcplaya' or self.command == 'HEAD':
+            return self.reply(200, b'')            # resolved when it plays
+        self.stream(f'yt:{vid}', {'name': vid, 'url': f'https://www.youtube.com/watch?v={vid}',
+                                  'yt_id': vid})
+
+    def relay_youtube(self, vid):
+        """Local-only: relay yt-dlp's download of one video to ffmpeg.
+
+        YouTube often answers 403 to the bare media URL (yt-dlp -g), but
+        yt-dlp's own downloader is accepted, so it fetches and we relay."""
+        # dcplaya opens every stream twice in a row and YouTube sometimes
+        # answers 403 to the second download: retry a few times.
+        for attempt in range(1, 4):
+            proc = subprocess.Popen(
+                ['yt-dlp', '--no-warnings', '--no-playlist', '-q', '--no-part',
+                 '--extractor-retries', '3', '-f', YT_FORMAT, '-o', '-',
+                 f'https://www.youtube.com/watch?v={vid}'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+            threading.Thread(target=self._drain_err, args=(proc, f'yt {vid}'), daemon=True).start()
+            data = proc.stdout.read(CHUNK)
+            if data:
+                break
+            stop_proc(proc)
+            log(f'youtube {vid}: no data (attempt {attempt})')
+            time.sleep(attempt)
+        else:
+            return self.reply(502, b'')
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/mp4')
+            self.end_headers()
+            while data:
+                self.wfile.write(data)
+                data = proc.stdout.read(CHUNK)
+        except OSError:
+            pass                         # ffmpeg went away (channel change)
+        finally:
+            stop_proc(proc)
+
     def stream(self, n, chan):
         key = self.client_key()
         log(f'start ch{n} {chan["name"]!r} for {key}')
-        proc = subprocess.Popen(ffmpeg_cmd(chan['url']), stdout=subprocess.PIPE,
+        try:
+            inp = source_args(chan)
+        except SourceError as e:
+            log(f'ch{n}: {e}')
+            return self.reply(502, b'source failed\n')
+        proc = subprocess.Popen(ffmpeg_cmd(inp), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, bufsize=0)
         register_stream(key, proc, self.connection)
         threading.Thread(target=self._drain_err, args=(proc, n), daemon=True).start()
@@ -388,6 +840,7 @@ def main():
         sys.exit('TOKEN is not set')
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     channels()
+    threading.Thread(target=yt_refresher, daemon=True).start()
     log(f'listening on :{PORT} ({WIDTH}x{HEIGHT}@{FPS} {VCODEC} {VBITRATE} + {ACODEC} {ABITRATE}{"" if VIDEO else ", audio only"})')
     Server(('0.0.0.0', PORT), Handler).serve_forever()
 

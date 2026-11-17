@@ -1,4 +1,4 @@
-"""Build a patched dcplaya CDI that plays IPTV through your dc-tv-proxy.
+"""Build a patched dcplaya CDI that plays IPTV and YouTube through your dc-tv-proxy.
 
     python build_cdi.py ORIGINAL.cdi OUTPUT.cdi --proxy HOST[:PORT] --token TOKEN
 
@@ -13,17 +13,17 @@ change or are added:
   LUA/NET.LUA                       DHCP by default
   LUA/SONG_BROWSER.LUA              playlists skip dead links without freezing; B stops
   LUA/KEYBOARD_EMU.LUA              Start pauses/resumes
-  EXTRA/TV.M3U (+ more)             channel playlist(s) pointing at your proxy
+  LUA/PLAYLIST.LUA                  "#DCPLAYA-REMOTE:" playlists fetched from the proxy
+  EXTRA/TV_PROXY.M3U                your TV channels, fetched from the proxy when opened
+  EXTRA/YOUTUBE.M3U                 latest videos of your YouTube channels, idem
 
-Where the channel list comes from (first that applies):
-  --playlist FILE   a ready dcplaya playlist (one per --proxy, same order)
-  --channels FILE   your IPTV m3u, converted locally (same order as on the proxy!)
-  (default)         downloaded from the running proxy: http://HOST/TOKEN/tv.m3u
+The two playlists hold no channels: every time they are opened the Dreamcast
+downloads the current list from the proxy, so channels edited on the proxy
+(or in its /admin page) show up without burning a new disc.
 
---proxy may be repeated, e.g. a LAN address and an internet hostname:
+--proxy may be repeated: the addresses are tried in order, e.g. the LAN
+address first and an internet hostname second:
   --proxy 192.168.1.20:8765 --proxy tv.example.com
-gives EXTRA/TV.M3U and EXTRA/TV2.M3U.  Add =NAME to choose the file name:
-  --proxy 192.168.1.20:8765=TV_LAN.M3U
 """
 import argparse
 import hashlib
@@ -33,7 +33,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -45,11 +44,13 @@ ORIGINALS = {
     'NET.LUA.orig': 'DCPLAYA/LUA/NET.LUA',
     'SONG_BROWSER.LUA.orig': 'DCPLAYA/LUA/SONG_BROWSER.LUA',
     'KEYBOARD_EMU.LUA.orig': 'DCPLAYA/LUA/KEYBOARD_EMU.LUA',
+    'PLAYLIST.LUA.orig': 'DCPLAYA/LUA/PLAYLIST.LUA',
     'NET.LEZ.orig': 'DCPLAYA/PLUGINS/EXE/NET/NET.LEZ',
 }
 HOST_RE = re.compile(r'^[A-Za-z0-9.-]+(:\d{1,5})?$')
-NAME_RE = re.compile(r'^[A-Z0-9_]{1,8}\.M3U$')
 TOKEN_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+# CD name -> proxy path (new names must sort after the disc's EXTRA/RADIO.M3U)
+PLAYLISTS = {'TV_PROXY.M3U': 'tv.m3u', 'YOUTUBE.M3U': 'yt/all.m3u'}
 
 
 def md5(path):
@@ -60,79 +61,28 @@ def md5(path):
     return h.hexdigest()
 
 
-def parse_proxies(specs):
-    out = []
-    named = {s.partition('=')[2].upper() for s in specs}
-    free = (n for n in ['TV.M3U'] + [f'TV{k}.M3U' for k in range(2, 10)] if n not in named)
-    for spec in specs:
-        host, _, name = spec.partition('=')
-        name = (name or next(free)).upper()
-        if not HOST_RE.match(host):
-            sys.exit(f'bad --proxy host: {host!r} (use HOST or HOST:PORT, no http://)')
-        if not NAME_RE.match(name):
-            sys.exit(f'bad playlist name: {name!r} (8.3 upper case, e.g. TV_LAN.M3U)')
-        if name.lower() <= 'radio.m3u':
-            # new directory entries are appended, so they must sort after the
-            # disc's own EXTRA/RADIO.M3U
-            sys.exit(f'bad playlist name: {name!r} must sort after RADIO.M3U (start with S..Z, e.g. TV_LAN.M3U)')
-        out.append((host, name))
-    if len({n for _, n in out}) != len(out):
-        sys.exit('playlist names must be different')
-    return out
-
-
-def check_playlist(text, where):
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    entries = [ln for ln in lines if ln.startswith('/http/')]
-    if not entries or not any(ln.startswith('#EXTINF:') for ln in lines):
-        sys.exit(f'{where}: does not look like a dcplaya playlist '
-                 '(expected #EXTINF lines and /http/... entries)')
-    try:
-        text.encode('ascii')
-    except UnicodeEncodeError:
-        sys.exit(f'{where}: playlist must be plain ASCII')
-    return len(entries)
-
-
-def fetch_playlist(host, token):
-    url = f'http://{host}/{token}/tv.m3u?host={host}'
-    try:
-        with urllib.request.urlopen(url, timeout=20) as r:
-            return r.read().decode('ascii')
-    except Exception as e:  # noqa: BLE001 - report any network/HTTP failure
-        sys.exit(f'could not download the playlist from {url.replace(token, "<TOKEN>")}: {e}\n'
-                 'Is the proxy running and reachable from this PC? '
-                 'Otherwise use --channels or --playlist.')
-
-
-def local_playlist(host, token, channels):
-    sys.path.insert(0, os.path.join(HERE, '..', 'proxy'))
-    import server   # noqa: E402  (the proxy's own playlist generator)
-    chans = server.parse_m3u(channels)
-    if not chans:
-        sys.exit(f'{channels}: no channels found')
-    return server.dc_playlist(host, token, chans)
+def remote_playlist(hosts, token, path):
+    """Stub read by the patched PLAYLIST.LUA: try each address in order."""
+    lines = [f'#DCPLAYA-REMOTE:/http/{h}/{token}/{path}?host={h}' for h in hosts]
+    return '\n'.join(lines + ['#EXTM3U']) + '\n'
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('original', help='original dcplaya CDI')
     ap.add_argument('output', help='CDI to write')
-    ap.add_argument('--proxy', action='append', required=True, metavar='HOST[:PORT][=NAME.M3U]',
-                    help='address the Dreamcast uses to reach the proxy (repeatable)')
+    ap.add_argument('--proxy', action='append', required=True, metavar='HOST[:PORT]',
+                    help='address the Dreamcast uses to reach the proxy (repeatable, tried in order)')
     ap.add_argument('--token', required=True, help='TOKEN from the proxy .env')
-    src = ap.add_mutually_exclusive_group()
-    src.add_argument('--channels', metavar='IPTV.m3u', help='build the playlist from this IPTV list')
-    src.add_argument('--playlist', action='append', metavar='DC.m3u',
-                     help='use a ready dcplaya playlist (one per --proxy)')
+    ap.add_argument('--no-youtube', action='store_true', help='leave out YOUTUBE.M3U')
     ap.add_argument('--keep-work', action='store_true', help='keep the temporary work folder')
     a = ap.parse_args()
 
-    proxies = parse_proxies(a.proxy)
+    for h in a.proxy:
+        if not HOST_RE.match(h):
+            sys.exit(f'bad --proxy host: {h!r} (use HOST or HOST:PORT, no http://)')
     if not TOKEN_RE.match(a.token) or a.token == 'change-me':
         sys.exit('set a real --token (letters, digits, - and _ only)')
-    if a.playlist and len(a.playlist) != len(proxies):
-        sys.exit('give one --playlist per --proxy')
     if os.path.abspath(a.original) == os.path.abspath(a.output):
         sys.exit('output must be a different file')
 
@@ -161,23 +111,15 @@ def main():
         subprocess.run([sys.executable, os.path.join(HERE, 'patch_netlez.py'),
                         os.path.join(work, 'NET.LEZ.orig'), os.path.join(out, 'NET.LEZ')], check=True)
 
-        # 4. playlists
+        # 4. remote playlists
         adds = []
-        for i, (host, name) in enumerate(proxies):
-            if a.playlist:
-                text = open(a.playlist[i], encoding='ascii', errors='strict').read()
-                where = a.playlist[i]
-            elif a.channels:
-                text, where = local_playlist(host, a.token, a.channels), a.channels
-            else:
-                text, where = fetch_playlist(host, a.token), f'proxy {host}'
-            n = check_playlist(text, where)
-            path = os.path.join(work, name)
-            with open(path, 'w', encoding='ascii', newline='\n') as f:
-                f.write(text)
-            adds.append((name.lower(), ['--add', f'EXTRA/{name}={path}']))
-            print(f'{name}: {n} channels via {host}')
-        adds = [arg for _, pair in sorted(adds) for arg in pair]   # ISO order
+        for name, path in sorted(PLAYLISTS.items()):
+            if a.no_youtube and name == 'YOUTUBE.M3U':
+                continue
+            local = os.path.join(work, name)
+            with open(local, 'w', encoding='ascii', newline='\n') as f:
+                f.write(remote_playlist(a.proxy, a.token, path))
+            adds += ['--add', f'EXTRA/{name}={local}']
 
         # 5. the image
         subprocess.run([sys.executable, os.path.join(HERE, 'patch_cdi.py'), a.original, a.output,
@@ -188,9 +130,10 @@ def main():
         else:
             shutil.rmtree(work, ignore_errors=True)
 
+    names = [n.lower() for n in sorted(PLAYLISTS) if not (a.no_youtube and n == 'YOUTUBE.M3U')]
     print(f'\ndone: {a.output}')
     print('Burn it (DiscJuggler/ImgBurn) or load it in an ODE, then on the Dreamcast open '
-          '/cd/extra/ and play ' + ', '.join(n.lower() for _, n in proxies) + '.')
+          '/cd/extra/ and play ' + ' or '.join(names) + '.')
 
 
 if __name__ == '__main__':

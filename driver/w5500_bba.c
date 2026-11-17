@@ -605,11 +605,87 @@ static int w_hw_init(netif_t *self)
 static int w_check_link(void)
 {
     int up = w_read8(BLK_COMMON, W_PHYCFGR) & 1;
-    if (up != link_up) {
-        link_up = up;
-        printf("w5500: link %s\n", up ? "up" : "down");
-    }
+    /* No printf here: this also runs in the RX thread, and dcplaya's console
+       is not thread-safe (a print racing with Lua's corrupts it). */
+    link_up = up;
     return up;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Handing frames to lwIP from a thread                                       */
+/*                                                                            */
+/* NET.LEZ's input hook (kos_input) was written for the BBA's interrupt       */
+/* handler: it calls thd_schedule_next(lwip_thread) and appends the frame to  */
+/* a queue that its thread drains with interrupts off.  The W5500 has no IRQ  */
+/* line, so we deliver from the RX thread, and there:                         */
+/*  - thd_schedule_next() swaps thd_current without a context switch (the     */
+/*    switch is supposed to happen on IRQ return), so the next timer tick     */
+/*    saves this thread's registers into the lwIP thread -> two threads with  */
+/*    mixed contexts, wild jumps, corrupted heap (seen as a crash in Lua's    */
+/*    garbage collector, EXC_INSTR_ADDRESS in _markvalue);                    */
+/*  - the queue append can be preempted halfway by the consumer.              */
+/* Fix: the hook's thd_schedule_next literal is pointed at a wrapper that     */
+/* only acts inside an interrupt (the real BBA path is unchanged), and frames */
+/* are delivered with interrupts disabled, like in an IRQ handler.            */
+/* ------------------------------------------------------------------------- */
+
+extern void *lef_find_symbol_all(const char *name);
+
+static void (*real_sched_next)(void *thd);
+static uint32 sem_signal_addr;
+static void **input_target;          /* &net_input_target */
+static void *patched_hook;
+
+static void safe_sched_next(void *thd)
+{
+    if (irq_inside_int() && real_sched_next)
+        real_sched_next(thd);
+}
+
+/* Called once from w_if_start (caller's thread): symbol lookups walk the LEF
+   list, which the player rewrites while loading codec plugins, so they must
+   never run in the RX thread. */
+static void resolve_hook_syms(void)
+{
+    if (!input_target)
+        input_target = (void **)lef_find_symbol_all("_net_input_target");
+    if (!real_sched_next)
+        real_sched_next = (void (*)(void *))lef_find_symbol_all("_thd_schedule_next");
+    if (!sem_signal_addr)
+        sem_signal_addr = (uint32)lef_find_symbol_all("_sem_signal");
+}
+
+/* Replace &thd_schedule_next in the literal pool of the current input hook.
+   Runs in the RX thread: plain memory accesses only. */
+static void patch_input_hook(void)
+{
+    uint32 *w, *end;
+    void *hook;
+
+    if (!input_target || !real_sched_next || !sem_signal_addr)
+        return;
+    hook = *input_target;
+    if (!hook || hook == patched_hook)
+        return;
+    patched_hook = hook;                 /* look at each hook only once */
+    /* the hook is ~0xc0 bytes; its literal pool ends with &sem_signal */
+    w = (uint32 *)(((uint32)hook + 3) & ~3u);
+    for (end = w + 0x60; w < end; w++) {
+        if (*w == (uint32)real_sched_next)
+            *w = (uint32)safe_sched_next;
+        else if (*w == sem_signal_addr)
+            break;
+    }
+}
+
+static void deliver(netif_t *self, const uint8 *data, int len)
+{
+    int s;
+
+    patch_input_hook();
+    s = irq_disable();
+    net_input(self, data, len);
+    irq_restore(s);
 }
 
 /* Returns 1 if a frame was handled, 0 if nothing pending. */
@@ -654,7 +730,7 @@ static int w_rx_one(netif_t *self)
     lock_give();
 
     if (n >= 14 && (self->flags & NETIF_RUNNING))
-        net_input(self, rx_buf, n);
+        deliver(self, rx_buf, n);
     return 1;
 }
 
@@ -739,6 +815,7 @@ static int w_if_start(netif_t *self)
         printf("w5500: no link yet (cable?), starting anyway\n");
 
     rx_exit = 0;
+    resolve_hook_syms();                 /* before the RX thread exists */
     rx_thd = thd_create(w_rx_thread, self);
     if (!rx_thd) {
         printf("w5500: cannot create RX thread\n");

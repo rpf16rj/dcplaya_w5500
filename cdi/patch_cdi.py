@@ -9,6 +9,7 @@ header) to add W5500 + DHCP + asynchronous stream checks:
   DCPLAYA/LUA/NET.LUA                       DHCP + loads netprobe.lez
   DCPLAYA/LUA/SONG_BROWSER.LUA              playlist checks streams in background
   DCPLAYA/LUA/KEYBOARD_EMU.LUA              Start pauses/resumes playback
+  DCPLAYA/LUA/PLAYLIST.LUA                  #DCPLAYA-REMOTE: playlists from the proxy
 
 New data goes into the ISO's free padding (150 zero sectors at the end of the
 volume).  Both the ISO9660(+Rock Ridge) and the Joliet trees are updated.
@@ -177,7 +178,7 @@ def main():
     iso.add(NET, 'NETPROBE.LEZ', 'NET.LEZ', iso.store(probe), len(probe))
 
     # Lua
-    for name in ('NET.LUA', 'SONG_BROWSER.LUA', 'KEYBOARD_EMU.LUA'):
+    for name in ('NET.LUA', 'SONG_BROWSER.LUA', 'KEYBOARD_EMU.LUA', 'PLAYLIST.LUA'):
         data = rd(a.lua_dir, name)
         iso.repoint(['DCPLAYA', 'LUA', name], iso.store(data), len(data))
 

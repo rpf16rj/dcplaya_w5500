@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dc-tv-proxy</title>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+  --accent: #e35d10; --accent-ink: #ffffff; --ok: #16794a; --bad: #c0362c; --warn-bg: #fff4e5;
+  --input: #ffffff; --row-hover: #f8f9fb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1b1f27; --text: #e6e8ec; --muted: #9aa3b2; --line: #2b313c;
+    --accent: #ff7a2f; --accent-ink: #1b1f27; --ok: #4cc38a; --bad: #ff6b5e; --warn-bg: #2a2219;
+    --input: #141820; --row-hover: #20252f;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 14px 20px;
+         background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+header h1 span { color: var(--accent); }
+nav { display: flex; gap: 4px; }
+nav button { background: none; border: 0; color: var(--muted); padding: 8px 12px; border-radius: 8px;
+             font: inherit; cursor: pointer; }
+nav button.on { background: var(--bg); color: var(--text); font-weight: 600; }
+.spacer { flex: 1; }
+main { max-width: 1200px; margin: 0 auto; padding: 16px 20px 96px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.note { background: var(--warn-bg); border-radius: 8px; padding: 10px 12px; color: var(--text); margin-bottom: 12px; font-size: 13px; }
+input, textarea { background: var(--input); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+                  padding: 7px 9px; font: inherit; width: 100%; min-width: 0; }
+input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+button.btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 8px;
+             padding: 7px 12px; font: inherit; cursor: pointer; white-space: nowrap; }
+button.btn:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.icon { padding: 5px 8px; min-width: 32px; }
+button:disabled { opacity: .45; cursor: default; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px; border-bottom: 1px solid var(--line); }
+td { padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:hover td { background: var(--row-hover); }
+td.num { color: var(--muted); width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
+td.actions { white-space: nowrap; width: 1%; }
+.group { color: var(--muted); font-size: 12px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+.status { font-size: 12px; margin-top: 3px; }
+.status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
+.meta { color: var(--muted); font-size: 12px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; word-break: break-all; }
+.savebar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 1px solid var(--line);
+           padding: 12px 20px; display: none; align-items: center; gap: 12px; z-index: 6; }
+.savebar.show { display: flex; }
+.toast { position: fixed; right: 20px; bottom: 76px; background: var(--text); color: var(--bg); padding: 10px 14px;
+         border-radius: 10px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 7; max-width: 420px; }
+.toast.show { opacity: 1; }
+.addrow { display: grid; grid-template-columns: 1fr 2fr auto; gap: 8px; }
+details summary { cursor: pointer; color: var(--muted); }
+@media (max-width: 760px) {
+  header { flex-wrap: wrap; padding: 12px 16px; }
+  main { padding: 12px 16px 110px; }
+  .addrow { grid-template-columns: 1fr; }
+  table, tbody, tr, td { display: block; width: 100%; }
+  thead { display: none; }
+  tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
+  td { border: 0; padding: 3px 0; }
+  td.num { text-align: left; width: auto; }
+  .group { max-width: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>dc-tv-proxy <span>admin</span></h1>
+  <nav>
+    <button id="tab-tv" class="on" onclick="show('tv')">TV <span id="cnt-tv"></span></button>
+    <button id="tab-yt" onclick="show('yt')">YouTube <span id="cnt-yt"></span></button>
+  </nav>
+  <div class="spacer"></div>
+  <button class="btn" onclick="load(true)">Recarregar</button>
+</header>
+
+<main>
+  <section id="view-tv">
+    <div class="note">O Dreamcast busca esta lista no proxy toda vez que abre <span class="mono">tv_proxy.m3u</span>:
+      as mudanças aparecem na hora, sem gravar CD.</div>
+    <div class="card">
+      <div class="toolbar">
+        <input id="tv-filter" placeholder="Filtrar por nome ou grupo" style="max-width:320px" oninput="render()">
+        <span class="meta" id="tv-info"></span>
+      </div>
+      <table>
+        <thead><tr><th>#</th><th>Nome</th><th>URL do stream</th><th></th></tr></thead>
+        <tbody id="tv-body"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <b>Adicionar canal</b>
+      <div class="addrow" style="margin-top:8px">
+        <input id="tv-new-name" placeholder="Nome">
+        <input id="tv-new-url" placeholder="http://... (stream IPTV ou link do YouTube)">
+        <button class="btn primary" onclick="addTv()">Adicionar no fim</button>
+      </div>
+      <details style="margin-top:12px">
+        <summary>Importar de uma lista m3u (colar)</summary>
+        <textarea id="tv-import" rows="6" style="margin-top:8px" placeholder="#EXTINF:-1 group-title=&quot;...&quot;,Nome&#10;http://..."></textarea>
+        <button class="btn" style="margin-top:8px" onclick="importTv()">Adicionar ao fim</button>
+      </details>
+    </div>
+  </section>
+
+  <section id="view-yt" hidden>
+    <div class="note">No Dreamcast, <span class="mono">youtube.m3u</span> mostra os vídeos mais recentes de
+      todos os canais (com o nome do canal na frente), atualizados a cada <span id="yt-hours"></span> h.
+      Canais novos aparecem lá sem gravar CD.</div>
+    <div class="card">
+      <div class="toolbar">
+        <button class="btn" onclick="refreshYt()">Atualizar vídeos agora</button>
+        <span class="meta" id="yt-info"></span>
+      </div>
+      <table>
+        <thead><tr><th>#</th><th>Nome</th><th>Canal do YouTube</th><th>Vídeos</th><th></th></tr></thead>
+        <tbody id="yt-body"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <b>Adicionar canal do YouTube</b>
+      <div class="addrow" style="margin-top:8px">
+        <input id="yt-new-name" placeholder="Nome">
+        <input id="yt-new-url" placeholder="@canal ou https://www.youtube.com/@canal">
+        <button class="btn primary" onclick="addYt()">Adicionar no fim</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="savebar" id="savebar">
+  <span id="savemsg">Alterações não salvas</span>
+  <div class="spacer"></div>
+  <button class="btn" onclick="load(true)">Descartar</button>
+  <button class="btn primary" onclick="save()">Salvar</button>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let state = { tv: [], yt: [] };
+let dirty = { tv: false, yt: false };
+let current = 'tv';
+const checks = {};          // url -> {ok, msg}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 3500);
+}
+function group(attrs) {
+  const m = /group-title="([^"]*)"/.exec(attrs || '');
+  return m ? m[1] : '';
+}
+async function api(path, body) {
+  // location.origin never carries user:password@ (fetch refuses such URLs)
+  const r = await fetch(location.origin + path, body === undefined ? { credentials: 'same-origin' } : {
+    credentials: 'same-origin',
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+  if (!r.ok && j.ok !== false) j.ok = false;
+  return j;
+}
+async function load(ask) {
+  if (ask && (dirty.tv || dirty.yt) && !confirm('Descartar as alterações não salvas?')) return;
+  const s = await api('/admin/api/state');
+  state = s; dirty = { tv: false, yt: false };
+  document.getElementById('yt-hours').textContent = s.refresh_hours;
+  render();
+}
+function markDirty() { dirty[current] = true; renderSavebar(); }
+function renderSavebar() {
+  const any = dirty.tv || dirty.yt;
+  document.getElementById('savebar').classList.toggle('show', any);
+  const which = [dirty.tv && 'TV', dirty.yt && 'YouTube'].filter(Boolean).join(' e ');
+  document.getElementById('savemsg').textContent = 'Alterações não salvas: ' + which;
+}
+function show(tab) {
+  current = tab;
+  for (const t of ['tv', 'yt']) {
+    document.getElementById('view-' + t).hidden = t !== tab;
+    document.getElementById('tab-' + t).classList.toggle('on', t === tab);
+  }
+}
+function statusHtml(url) {
+  const c = checks[url];
+  if (!c) return '';
+  if (c.pending) return '<div class="status">testando…</div>';
+  return `<div class="status ${c.ok ? 'ok' : 'bad'}">${c.ok ? '✓' : '✗'} ${esc(c.msg)}</div>`;
+}
+function rowButtons(kind, i, n) {
+  return `<button class="btn icon" title="Subir" ${i === 0 ? 'disabled' : ''} onclick="move('${kind}',${i},-1)">↑</button>
+          <button class="btn icon" title="Descer" ${i === n - 1 ? 'disabled' : ''} onclick="move('${kind}',${i},1)">↓</button>
+          <button class="btn" onclick="test('${kind}',${i})">Testar</button>
+          <button class="btn icon" title="Apagar" onclick="del('${kind}',${i})">✕</button>`;
+}
+function render() {
+  const f = document.getElementById('tv-filter').value.trim().toLowerCase();
+  const tv = state.tv.map((c, i) => [c, i]).filter(([c]) =>
+    !f || c.name.toLowerCase().includes(f) || group(c.attrs).toLowerCase().includes(f));
+  document.getElementById('tv-body').innerHTML = tv.map(([c, i]) => `
+    <tr>
+      <td class="num">${i + 1}</td>
+      <td><input value="${esc(c.name)}" oninput="edit('tv',${i},'name',this.value)">
+          ${group(c.attrs) ? `<div class="group">${esc(group(c.attrs))}</div>` : ''}</td>
+      <td><input class="mono" value="${esc(c.url)}" oninput="edit('tv',${i},'url',this.value)">${statusHtml(c.url)}</td>
+      <td class="actions">${rowButtons('tv', i, state.tv.length)}</td>
+    </tr>`).join('');
+  document.getElementById('tv-info').textContent = f ? `${tv.length} de ${state.tv.length} canais` : `${state.tv.length} canais`;
+  document.getElementById('cnt-tv').textContent = `(${state.tv.length})`;
+
+  document.getElementById('yt-body').innerHTML = state.yt.map((c, i) => `
+    <tr>
+      <td class="num">${i + 1}</td>
+      <td><input value="${esc(c.name)}" oninput="edit('yt',${i},'name',this.value)">
+          <div class="group mono">yt/${i + 1}.m3u</div></td>
+      <td><input class="mono" value="${esc(c.url)}" oninput="edit('yt',${i},'url',this.value)">${statusHtml(c.url)}</td>
+      <td class="meta">${c.videos == null ? '—' : c.videos + ' vídeos'}${c.updated ? '<br>' + esc(c.updated) : ''}
+          ${c.latest ? `<div class="group" title="${esc(c.latest)}">${esc(c.latest)}</div>` : ''}</td>
+      <td class="actions">${rowButtons('yt', i, state.yt.length)}</td>
+    </tr>`).join('') || '<tr><td colspan="5" class="meta">Nenhum canal.</td></tr>';
+  document.getElementById('cnt-yt').textContent = `(${state.yt.length})`;
+  renderSavebar();
+}
+function edit(kind, i, field, value) { state[kind][i][field] = value; dirty[kind] = true; renderSavebar(); }
+function move(kind, i, d) {
+  const a = state[kind], j = i + d;
+  if (j < 0 || j >= a.length) return;
+    [a[i], a[j]] = [a[j], a[i]]; dirty[kind] = true; render();
+}
+function del(kind, i) {
+  const c = state[kind][i];
+  if (!confirm(`Apagar "${c.name}"?` + (i < state[kind].length - 1 ? '\nOs canais depois dele mudam de número.' : ''))) return;
+  state[kind].splice(i, 1); dirty[kind] = true; render();
+}
+async function test(kind, i) {
+  const url = state[kind][i].url.trim();
+  checks[url] = { pending: true }; render();
+  const r = await api('/admin/api/check', { url });
+  checks[url] = { ok: r.ok, msg: r.msg || r.error || '' }; render();
+}
+function addTv() {
+  const name = document.getElementById('tv-new-name').value.trim();
+  const url = document.getElementById('tv-new-url').value.trim();
+  if (!/^https?:\/\/\S+$/.test(url)) return toast('Informe uma URL http(s) válida.');
+  state.tv.push({ name: name || url.split('/').pop(), url, attrs: '' });
+  document.getElementById('tv-new-name').value = ''; document.getElementById('tv-new-url').value = '';
+  dirty.tv = true; render(); toast(`Canal ${state.tv.length} adicionado. Clique em Salvar.`);
+}
+function importTv() {
+  const lines = document.getElementById('tv-import').value.split(/\r?\n/);
+  let ext = null, added = 0;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTINF')) { ext = line; continue; }
+    if (line.startsWith('#') || !/^https?:\/\//.test(line)) continue;
+    let attrs = '', name = '';
+    if (ext) {
+      const body = ext.slice(ext.indexOf(':') + 1);
+      let q = false, cut = -1;
+      for (let i = 0; i < body.length; i++) {
+        if (body[i] === '"') q = !q;
+        else if (body[i] === ',' && !q) { cut = i; break; }
+      }
+      attrs = (cut >= 0 ? body.slice(0, cut) : body).replace(/^\s*-?\d+(\.\d+)?\s*/, '').trim();
+      name = cut >= 0 ? body.slice(cut + 1).trim() : '';
+    }
+    state.tv.push({ name: name || line.split('/').pop(), url: line, attrs });
+    ext = null; added++;
+  }
+  if (!added) return toast('Nenhum canal encontrado no texto.');
+  document.getElementById('tv-import').value = '';
+  dirty.tv = true; render(); toast(`${added} canais adicionados no fim. Clique em Salvar.`);
+}
+function ytUrl(v) {
+  v = v.trim();
+  if (/^@[\w.-]+$/.test(v)) return 'https://www.youtube.com/' + v;
+  if (/^UC[\w-]{20,}$/.test(v)) return 'https://www.youtube.com/channel/' + v;
+  if (/^(www\.)?youtube\.com\//.test(v)) return 'https://' + v;
+  return v;
+}
+async function addYt() {
+  const name = document.getElementById('yt-new-name').value.trim();
+  const url = ytUrl(document.getElementById('yt-new-url').value);
+  if (!/^https?:\/\/(www\.|m\.)?(youtube\.com|youtu\.be)\//.test(url)) return toast('Informe @canal ou um link do YouTube.');
+  toast('Conferindo o canal no YouTube…');
+  const r = await api('/admin/api/check', { url });
+  if (!r.ok && !confirm(`O YouTube não respondeu bem (${r.msg || r.error}). Adicionar mesmo assim?`)) return;
+  checks[url] = { ok: r.ok, msg: r.msg || r.error || '' };
+  state.yt.push({ name: name || url.split('/').pop().replace('@', ''), url, attrs: '' });
+  document.getElementById('yt-new-name').value = ''; document.getElementById('yt-new-url').value = '';
+  dirty.yt = true; render(); toast(`Canal ${state.yt.length} adicionado. Clique em Salvar.`);
+}
+async function refreshYt() {
+  const r = await api('/admin/api/yt/refresh', {});
+  toast(r.ok ? 'Atualizando as listas de vídeos… recarregue em alguns segundos.' : 'Erro: ' + r.error);
+  setTimeout(() => { if (!dirty.tv && !dirty.yt) load(); }, 8000);
+}
+async function save() {
+  for (const kind of ['tv', 'yt']) {
+    if (!dirty[kind]) continue;
+    const items = state[kind].map(c => ({ name: c.name, url: c.url, attrs: c.attrs || '' }));
+    const r = await api('/admin/api/' + kind, { items });
+    if (!r.ok) return toast('Erro ao salvar: ' + (r.error || '?'));
+    dirty[kind] = false;
+    toast(`Salvo: ${r.count} ${kind === 'tv' ? 'canais de TV' : 'canais do YouTube'}.`);
+  }
+  await load();
+}
+window.addEventListener('beforeunload', e => { if (dirty.tv || dirty.yt) { e.preventDefault(); e.returnValue = ''; } });
+load();
+</script>
+</body>
+</html>

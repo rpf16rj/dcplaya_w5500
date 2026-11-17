@@ -1,0 +1,8 @@
+# your IPTV list, secrets and build outputs
+proxy/.env
+proxy/data/*.m3u
+proxy/data/*.m3u8
+*.cdi
+cdi/work/
+driver/out/
+__pycache__/

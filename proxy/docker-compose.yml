@@ -1,0 +1,17 @@
+services:
+  dc-tv-proxy:
+    build: .
+    container_name: dc-tv-proxy
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    env_file: [.env, tune.env]   # .env = TOKEN (secret), tune.env = video/audio profile
+    environment:
+      CHANNELS: /data/channels.m3u
+    volumes:
+      - ./data:/data:ro          # put your IPTV list here as channels.m3u
+    mem_limit: 1g
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"

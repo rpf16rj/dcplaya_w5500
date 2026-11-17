@@ -316,7 +316,29 @@ static int lua_net_probe_cancel(lua_State *L)
     return 0;
 }
 
+/* Measurement builds: counters exported by BBA.LEZ (-DW5500_STATS).
+   Returns "us=..._rx=..._dl=..._fr=..._by=..._po=..._id=..." or nil. */
+static int lua_net_w5500_stats(lua_State *L)
+{
+    uint32 *st = (uint32 *)lef_find_symbol_all("_w5500_stats");
+    uint64 (*now)(void) = (uint64 (*)(void))lef_find_symbol_all("_timer_micro_gettime64");
+    char buf[160];
+
+    if (!st || !now) {
+        lua_pushnil(L);
+        return 1;
+    }
+    sprintf(buf, "us=%u_rx=%u_dl=%u_fr=%u_by=%u_po=%u_id=%u",
+            (unsigned)(uint32)now(), (unsigned)st[0], (unsigned)st[1], (unsigned)st[2],
+            (unsigned)st[3], (unsigned)st[4], (unsigned)st[5]);
+    lua_pushstring(L, buf);
+    return 1;
+}
+
 static luacmd_t commands[] = {
+    { "net_w5500_stats", 0, 0,
+      "net_w5500_stats() : W5500 driver CPU counters (measurement builds only).",
+      1, lua_net_w5500_stats, 0 },
     { "net_probe", 0, 0,
       "net_probe(path) : start checking an http stream in background.",
       1, lua_net_probe, 0 },

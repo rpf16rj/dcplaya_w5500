@@ -126,7 +126,7 @@ O token fica gravado dentro da imagem, então não compartilhe a sua CDI.
 
 O perfil em `proxy/tune.env` é o que tocou melhor num console **real** (W5500):
 
-- MPEG-1 192x144 a 15 fps e 150 kbit/s;
+- MPEG-1 **208x116** (16:9, sem faixas pretas) a 15 fps e 150 kbit/s;
 - MP3 44,1 kHz 128 kbit/s estéreo, normalizado em ~-14 LUFS (`loudnorm`).
 
 O limite é a CPU do Dreamcast decodificando vídeo com o ffmpeg de 2004 do
@@ -148,8 +148,18 @@ O que foi testado em console real e ficou **pior**:
 | MP3 mono, ou 22,05 kHz | o sincronismo áudio/vídeo se perde: vídeo pior e travamentos |
 | 224x168, 256x192, MPEG-2, MPEG-4 | lento demais, o som picota |
 | 128x96 | o console travou |
+| MPEG-4 em MPEG-TS, 256x144 a 400–600k (a receita da demo do Scrivani com VLC, `VCODEC=mpeg4 VFORMAT=mpegts`) | vídeo e áudio travam: o console só decodifica ~32 KiB/s dos ~67–95 do stream. O MPEG-4 gasta bem mais CPU por bit; com a BBA real (DMA) sobra CPU, com o W5500 não |
 | quadro completo a cada 10–20 (`GOP`) | mais lento, o som picota |
 | opções RD do encoder, desentrelaçamento | medem melhor no PC, ficam piores no DC |
+
+### Para onde vai a CPU (medido num console real com W5500)
+
+Com vídeo tocando, a CPU fica 97–99% ocupada. A leitura do W5500 pela SPI usava
+12–39% dela, cerca de 2 µs por byte. O driver atual escreve no registrador de
+status da SCI uma vez por byte, em vez de duas, e inverte os bits por tabela.
+Isso cortou o custo por byte em ~20%, e o console passou de ~57 para ~72 KiB/s
+consumidos. Uma BBA real não tem esse custo (DMA), por isso aguenta perfis mais
+pesados.
 
 ## YouTube
 

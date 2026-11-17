@@ -2,7 +2,7 @@
 
 The Dreamcast cannot decode today's HD/FHD H.264/H.265 IPTV streams, so this
 server pulls each channel and transcodes it live into what dcplaya 2.0b2's
-(2004) ffmpeg plugin plays on a real console: MPEG-1 video 192x144 @ 15 fps +
+(2004) ffmpeg plugin plays on a real console: MPEG-1 video 208x116 (16:9) @ 15 fps +
 MP3 44.1 kHz stereo in an MPEG-1 program stream, served over plain HTTP.
 
 Routes (TOKEN keeps your IPTV account from being usable by anybody):
@@ -23,7 +23,7 @@ a real Dreamcast, see tune.env):
   TOKEN          required, path secret
   CHANNELS       IPTV m3u                        (default /data/channels.m3u)
   PORT           listen port                     (default 8765)
-  WIDTH/HEIGHT   output size                     (default 192x144)
+  WIDTH/HEIGHT   output size                     (default 208x116, 16:9 without black bars)
   FPS            output frame rate               (default 15)
   VBITRATE       video bitrate                   (default 150k)
   GOP            frames between full frames      (default 30)
@@ -61,8 +61,8 @@ import urllib.request
 TOKEN = os.environ.get('TOKEN', '')
 CHANNELS = os.environ.get('CHANNELS', '/data/channels.m3u')
 PORT = int(os.environ.get('PORT', '8765'))
-WIDTH = int(os.environ.get('WIDTH', '192'))
-HEIGHT = int(os.environ.get('HEIGHT', '144'))
+WIDTH = int(os.environ.get('WIDTH', '208'))
+HEIGHT = int(os.environ.get('HEIGHT', '116'))
 FPS = os.environ.get('FPS', '15')
 VBITRATE = os.environ.get('VBITRATE', '150k')
 ABITRATE = os.environ.get('ABITRATE', '128k')
@@ -79,6 +79,7 @@ VSCALER = os.environ.get('VSCALER', 'area')    # area averages pixels: no aliasi
 VDENOISE = os.environ.get('VDENOISE', 'gblur=sigma=0.5,')  # after scaling: drops detail 192x144 can't show (blocky frames 107 -> 4 of 451)
 VDEINT = os.environ.get('VDEINT', '')  # e.g. bwdif=mode=send_frame:deint=interlaced, (looked worse on the DC)
 VCODEC = os.environ.get('VCODEC', 'mpeg1video')  # mpeg1video (PS), mpeg2video (VOB), mpeg4 (DivX AVI)
+VFORMAT = os.environ.get('VFORMAT', 'auto')     # auto (by codec) or mpegts
 AUDIO = os.environ.get('AUDIO', '1') != '0'
 VIDEO = os.environ.get('VIDEO', '1') != '0'   # VIDEO=0: audio-only stream
 PACE = float(os.environ.get('PACE', '1.25'))   # output rate = PACE x MUXRATE (0 = no pacing)
@@ -454,6 +455,31 @@ def admin_check(url):
     return ok, f'HTTP {why}' if ok else why
 
 
+_dcstats_prev = {}
+
+
+def dcstats_log(key, raw):
+    """Measurement builds: counters reported by the Dreamcast every ~10 s.
+
+    rx = W5500 RX thread busy time (SPI + delivery), dl = delivery to lwIP,
+    idle = counts of a lowest-priority spinner (grows only when the CPU is free).
+    """
+    try:
+        cur = {k: int(v) for k, v in (kv.split('=') for kv in raw.split('_'))}
+    except ValueError:
+        return log(f'dcstats {key}: bad report {raw[:80]!r}')
+    prev = _dcstats_prev.get(key)
+    _dcstats_prev[key] = cur
+    if not prev:
+        return log(f'dcstats {key}: first report')
+    d = {k: (cur[k] - prev[k]) & 0xFFFFFFFF for k in cur}
+    us = d['us'] or 1
+    log(f'dcstats {key}: {us / 1e6:.1f}s rx {100 * d["rx"] / us:.1f}% '
+        f'(lwIP delivery {100 * d["dl"] / us:.1f}%) frames {d["fr"] * 1e6 / us:.0f}/s '
+        f'{d["by"] * 1e6 / us / 1024:.1f} KiB/s polls {d["po"] * 1e6 / us:.0f}/s '
+        f'idle {d["id"] * 1e6 / us:.0f}/s')
+
+
 def yt_refresh_all_now():
     for n, chan in enumerate(yt_channels(), 1):
         yt_refresh(n, chan)
@@ -476,7 +502,7 @@ def ffmpeg_cmd(inp):
             '-strict', '-1' if (VCODEC == 'mpeg1video' and FPS not in STD_FPS) else 'normal',
             '-c:v', VCODEC, '-b:v', VBITRATE, '-maxrate', VBITRATE,
             '-bufsize', VBUFSIZE, '-g', GOP, '-bf', '0'] + VENC_EXTRA.split() + (
-            ['-vtag', 'DX50'] if VCODEC == 'mpeg4' else [])
+            ['-vtag', 'DX50'] if (VCODEC == 'mpeg4' and VFORMAT != 'mpegts') else [])
     else:
         video = ['-map', '0:a:0', '-vn']          # audio-only (diagnostics)
     return [
@@ -485,9 +511,19 @@ def ffmpeg_cmd(inp):
         '-probesize', '2M', '-analyzeduration', '3M',
         '-threads', '2',
     ] + inp + video + (['-af', AFILTER, '-c:a', ACODEC, '-ar', ASRATE, '-ac', ACHANNELS, '-b:a', ABITRATE] if AUDIO else ['-an']) + [
-    ] + (['-f', 'avi'] if VCODEC == 'mpeg4' else
-         ['-f', 'vob' if VCODEC == 'mpeg2video' else 'mpeg',
-          '-muxrate', MUXRATE, '-muxdelay', '0.7']) + ['pipe:1']
+    ] + container_args() + ['pipe:1']
+
+
+def container_args():
+    """Output container.  VFORMAT=mpegts is what Scrivani's VLC demo used
+    (MPEG-4 in MPEG-TS): every TS packet carries its own timestamps.  MUXRATE
+    then only sets the send pace (no padding in the stream)."""
+    if VFORMAT == 'mpegts':
+        return ['-f', 'mpegts', '-mpegts_flags', '+resend_headers', '-pat_period', '0.5']
+    if VCODEC == 'mpeg4':
+        return ['-f', 'avi']
+    return ['-f', 'vob' if VCODEC == 'mpeg2video' else 'mpeg',
+            '-muxrate', MUXRATE, '-muxdelay', '0.7']
 
 
 def stop_proc(p):
@@ -662,6 +698,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parts[1] == 'yt':
             return self.youtube_route(parts[2:])
+        if parts[1] == 'dcstats' and len(parts) == 3:
+            dcstats_log(self.client_key(), parts[2])
+            return self.reply(200, b'')
 
         m = re.fullmatch(r'(\d+)\.mpg', parts[2]) if len(parts) == 3 and parts[1] == 'ch' else None
         if not m:

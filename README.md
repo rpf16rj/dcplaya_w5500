@@ -123,7 +123,7 @@ The token ends up inside the image, so don't share your built CDI.
 The profile in `proxy/tune.env` is the one that played best on a **real**
 console (W5500):
 
-- MPEG-1 192x144 at 15 fps and 150 kbit/s;
+- MPEG-1 **208x116** (16:9, no black bars) at 15 fps and 150 kbit/s;
 - MP3 44.1 kHz 128 kbit/s stereo, normalized to about -14 LUFS (`loudnorm`).
 
 The limit is the Dreamcast CPU decoding video with dcplaya's 2004 ffmpeg, not
@@ -143,8 +143,17 @@ Things that were tried on real hardware and were **worse**:
 | MP3 mono, or 22.05 kHz | A/V sync breaks, worse video and freezes |
 | 224x168, 256x192, MPEG-2, MPEG-4 | too slow, audio stutters |
 | 128x96 | the console froze |
+| MPEG-4 in MPEG-TS, 256x144 at 400–600k (the recipe of Scrivani's VLC demo, `VCODEC=mpeg4 VFORMAT=mpegts`) | video and audio stall: the console decodes only ~32 KiB/s of the ~67–95 the stream carries. MPEG-4 needs much more CPU per bit; on a real BBA (DMA) there is CPU to spare, on the W5500 there isn't |
 | full frame every 10–20 (`GOP`) | slower, audio stutters |
 | RD encoder options, deinterlace | measure better on a PC, look worse on the DC |
+
+### Where the CPU goes (measured on a real console with a W5500)
+
+While video plays, the CPU is 97–99% busy. Reading the W5500 over SPI used
+12–39% of it, about 2 µs per byte. The current driver writes the SCI status
+register once per byte instead of twice and reverses bits with a table. That
+cut the cost per byte by ~20%, and the console went from ~57 to ~72 KiB/s
+consumed. A real BBA has no such cost (DMA), so it can afford heavier profiles.
 
 ## YouTube
 

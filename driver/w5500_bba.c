@@ -107,6 +107,16 @@ static inline uint8 bitrev8(uint8 b)
     return b;
 }
 
+/* Bit-reversal table (the SCI shifts LSB first, SPI is MSB first). */
+static uint8 rev_tab[256];
+
+static void rev_tab_init(void)
+{
+    int i;
+    for (i = 0; i < 256; i++)
+        rev_tab[i] = bitrev8((uint8)i);
+}
+
 /* ~>=1.5us: each P4 register read costs several peripheral bus cycles. */
 static void short_delay(void)
 {
@@ -173,6 +183,7 @@ static int sci_spi_init(void)
     thd_sleep(1);
 
     sci_xfer_mode = 0;
+    rev_tab_init();
     SCSSR1 &= (uint8)~(ORER | FER | PER);
     if (SCSSR1 & RDRF)
         (void)SCRDR1;
@@ -214,17 +225,29 @@ static void sci_write(const uint8 *d, int len)
     sci_wait(TEND);
 }
 
+/* SSR writes: flags are cleared by writing 0 after reading 1, writing 1 to a
+   flag has no effect.  So one write can acknowledge RDRF *and* clear TDRE
+   (which starts the next dummy byte) instead of two read-modify-writes on the
+   slow peripheral bus.  MPBT (bit 0) is written 0. */
+#define SSR_ACK_GO  ((uint8)~(TDRE | RDRF | 0x01))   /* ack byte, start next */
+#define SSR_ACK     ((uint8)~(RDRF | 0x01))          /* ack last byte only   */
+
+/* Hot path: every received Ethernet frame is read here, byte by byte.
+   Measured on a real console before this rewrite: ~2 us/byte, 13-39% of the
+   CPU while streaming video. */
 static void sci_read(uint8 *d, int len)
 {
     uint8 st;
     int t;
 
+    if (len <= 0)
+        return;
     sci_set_mode(TE | RE);
     if (sci_wait(TDRE))
         return;
     SCTDR1 = 0xFF;                      /* dummy byte clocked repeatedly */
+    SCSSR1 = SSR_ACK_GO;                /* TDRE was read as 1: start byte 1 */
     while (len-- > 0) {
-        SCSSR1 &= (uint8)~TDRE;
         t = 0;
         do {
             st = SCSSR1;
@@ -240,8 +263,9 @@ static void sci_read(uint8 *d, int len)
                 return;
             }
         } while (!(st & RDRF));
-        *d++ = bitrev8(SCRDR1);
-        SCSSR1 &= (uint8)~RDRF;
+        st = SCRDR1;
+        SCSSR1 = len ? SSR_ACK_GO : SSR_ACK;
+        *d++ = rev_tab[st];
     }
 }
 
@@ -631,6 +655,22 @@ static int w_check_link(void)
 
 extern void *lef_find_symbol_all(const char *name);
 
+#ifdef W5500_STATS
+/* Measurement build only: where does the console's CPU go?  Read by the
+   Lua command net_w5500_stats() (netprobe.lez) through this symbol. */
+typedef struct {
+    uint32 rx_us;       /* RX thread busy time (SPI + delivery), microseconds */
+    uint32 deliver_us;  /* part of rx_us spent inside net_input (lwIP enqueue) */
+    uint32 frames, bytes, polls;
+    uint32 idle;        /* lowest-priority spin counter: grows only when the CPU is free */
+} w5500_stats_t;
+w5500_stats_t w5500_stats;
+static uint64 (*us_now)(void);
+#define T_NOW() (us_now ? (uint32)us_now() : 0)
+#else
+#define T_NOW() 0
+#endif
+
 static void (*real_sched_next)(void *thd);
 static uint32 sem_signal_addr;
 static void **input_target;          /* &net_input_target */
@@ -653,6 +693,10 @@ static void resolve_hook_syms(void)
         real_sched_next = (void (*)(void *))lef_find_symbol_all("_thd_schedule_next");
     if (!sem_signal_addr)
         sem_signal_addr = (uint32)lef_find_symbol_all("_sem_signal");
+#ifdef W5500_STATS
+    if (!us_now)
+        us_now = (uint64 (*)(void))lef_find_symbol_all("_timer_micro_gettime64");
+#endif
 }
 
 /* Replace &thd_schedule_next in the literal pool of the current input hook.
@@ -682,10 +726,18 @@ static void deliver(netif_t *self, const uint8 *data, int len)
 {
     int s;
 
+#ifdef W5500_STATS
+    uint32 t0 = T_NOW();
+#endif
     patch_input_hook();
     s = irq_disable();
     net_input(self, data, len);
     irq_restore(s);
+#ifdef W5500_STATS
+    w5500_stats.deliver_us += T_NOW() - t0;
+    w5500_stats.frames++;
+    w5500_stats.bytes += len;
+#endif
 }
 
 /* Returns 1 if a frame was handled, 0 if nothing pending. */
@@ -739,6 +791,18 @@ static int w_rx_one(netif_t *self)
 
 extern void *lef_find_symbol_all(const char *name);
 
+#ifdef W5500_STATS
+static void idle_spin(void *param)
+{
+    (void)param;
+    for (;;) {
+        w5500_stats.idle++;
+        if (!(w5500_stats.idle & 0x3ff))
+            thd_pass();
+    }
+}
+#endif
+
 static void w_rx_thread(void *param)
 {
     netif_t *self = (netif_t *)param;
@@ -747,11 +811,18 @@ static void w_rx_thread(void *param)
     rx_running = 1;
     while (!rx_exit) {
         int n = 0;
+#ifdef W5500_STATS
+        uint32 t0 = T_NOW();
+#endif
         /* Drain everything the W5500 has buffered in one go.  Handing over
            one frame per thd_pass() made each frame wait behind a full time
            slice of the (CPU-bound) video decoder. */
         while (n < RX_BATCH && !rx_exit && w_rx_one(self))
             n++;
+#ifdef W5500_STATS
+        w5500_stats.rx_us += T_NOW() - t0;
+        w5500_stats.polls++;
+#endif
         if (n) {
             idle = 0;
             if (n >= RX_BATCH)
@@ -830,6 +901,13 @@ static int w_if_start(netif_t *self)
             (int (*)(kthread_t *, int))lef_find_symbol_all("_thd_set_prio");
         if (set_prio)
             set_prio(rx_thd, RX_PRIO);
+#ifdef W5500_STATS
+        {
+            kthread_t *it = thd_create(idle_spin, NULL);
+            if (it && set_prio)
+                set_prio(it, 200);       /* runs only when nothing else wants the CPU */
+        }
+#endif
     }
 
     self->flags |= NETIF_RUNNING;
